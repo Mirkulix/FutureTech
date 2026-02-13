@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ternary-llm"
+version = "1.0.0"
+description = "Quantum-Informed Accelerated Training for Ternary LLMs"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "TernaryLLM Team"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.21.0",
+]
+
+[project.optional-dependencies]
+full = [
+    "torch>=2.0.0",
+    "tqdm>=4.65.0",
+    "psutil>=5.9.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+]
+
+[project.scripts]
+ternary-llm = "ternary_llm.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/user/ternary-llm"
+Documentation = "https://github.com/user/ternary-llm#readme"
+Repository = "https://github.com/user/ternary-llm"
