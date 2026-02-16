@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { PythonBridge } from '@/lib/python-bridge'
+import path from 'path'
 
 // GET - List all trainings
 export async function GET() {
@@ -12,7 +14,7 @@ export async function GET() {
       },
       orderBy: { createdAt: 'desc' }
     })
-    
+
     return NextResponse.json({ trainings })
   } catch (error) {
     console.error('Error fetching trainings:', error)
@@ -26,84 +28,38 @@ export async function GET() {
 // POST - Create a new training
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    
-    const {
-      name,
-      modelConfigId,
-      datasetId,
-      learningRate = 0.0003,
-      batchSize = 32,
-      epochs = 3,
-      warmupSteps = 100,
-      weightDecay = 0.01,
-      entropyThreshold = 2.5,
-      fisherOptimization = false,
-      gradientAccumSteps = 1
-    } = body
-    
-    // Validate required fields
-    if (!name || !modelConfigId || !datasetId) {
-      return NextResponse.json(
-        { error: 'Missing required fields: name, modelConfigId, datasetId' },
-        { status: 400 }
-      )
-    }
-    
-    // Check if model config exists
-    const modelConfig = await db.modelConfig.findUnique({
-      where: { id: modelConfigId }
-    })
-    
-    if (!modelConfig) {
-      return NextResponse.json(
-        { error: 'Model config not found' },
-        { status: 404 }
-      )
-    }
-    
-    // Check if dataset exists
-    const dataset = await db.dataset.findUnique({
-      where: { id: datasetId }
-    })
-    
-    if (!dataset) {
-      return NextResponse.json(
-        { error: 'Dataset not found' },
-        { status: 404 }
-      )
-    }
-    
-    // Create training
-    const training = await db.training.create({
-      data: {
-        name,
-        modelConfigId,
-        datasetId,
-        learningRate,
-        batchSize,
-        epochs,
-        warmupSteps,
-        weightDecay,
-        entropyThreshold,
-        fisherOptimization,
-        gradientAccumSteps,
-        totalSteps: epochs * 1000, // Estimated total steps
-        lossHistory: '[]'
-      },
-      include: {
-        modelConfig: true,
-        dataset: true
-      }
-    })
-    
-    return NextResponse.json({ training }, { status: 201 })
+    const body = await request.json();
+    // Destructure expected fields; add defaults or validation as needed
+    const { name, model, dataset, epochs, batchSize, learningRate, useFisher } = body;
+
+    // Generate a simple ID (in real app, DB would generate this)
+    const id = Date.now().toString();
+    const outputDir = path.join(process.cwd(), 'output', id);
+    const dataPath = path.join(process.cwd(), 'data');
+
+    const pid = PythonBridge.startTraining({
+      id,
+      data: dataPath,
+      output: outputDir,
+      epochs: Number(epochs),
+      batchSize: Number(batchSize),
+      learningRate: Number(learningRate),
+      useFisher: Boolean(useFisher),
+      baseModel: model || 'base'
+    });
+
+    return NextResponse.json({
+      status: 'started',
+      message: 'Training started successfully',
+      trainingId: id,
+      pid
+    });
   } catch (error) {
-    console.error('Error creating training:', error)
-    return NextResponse.json(
-      { error: 'Failed to create training' },
-      { status: 500 }
-    )
+    console.error('Failed to start training:', error);
+    return NextResponse.json({
+      status: 'error',
+      message: 'Failed to start training process'
+    }, { status: 500 });
   }
 }
 
@@ -112,30 +68,30 @@ export async function PUT(request: NextRequest) {
   try {
     const body = await request.json()
     const { id, action } = body
-    
+
     if (!id || !action) {
       return NextResponse.json(
         { error: 'Missing required fields: id, action' },
         { status: 400 }
       )
     }
-    
+
     const training = await db.training.findUnique({
       where: { id }
     })
-    
+
     if (!training) {
       return NextResponse.json(
         { error: 'Training not found' },
         { status: 404 }
       )
     }
-    
+
     let updateData: Record<string, unknown> = {}
-    
+
     switch (action) {
       case 'start':
-        updateData = { 
+        updateData = {
           status: 'running',
           startTime: new Date()
         }
@@ -147,8 +103,8 @@ export async function PUT(request: NextRequest) {
         updateData = { status: 'running' }
         break
       case 'stop':
-        updateData = { 
-          status: 'failed',
+        updateData = {
+          status: 'stopped',
           endTime: new Date()
         }
         break
@@ -158,7 +114,7 @@ export async function PUT(request: NextRequest) {
           { status: 400 }
         )
     }
-    
+
     const updatedTraining = await db.training.update({
       where: { id },
       data: updateData,
@@ -167,7 +123,7 @@ export async function PUT(request: NextRequest) {
         dataset: true
       }
     })
-    
+
     return NextResponse.json({ training: updatedTraining })
   } catch (error) {
     console.error('Error updating training:', error)
@@ -183,24 +139,24 @@ export async function DELETE(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
     const id = searchParams.get('id')
-    
+
     if (!id) {
       return NextResponse.json(
         { error: 'Missing training id' },
         { status: 400 }
       )
     }
-    
+
     // Delete associated exports first
     await db.modelExport.deleteMany({
       where: { trainingId: id }
     })
-    
+
     // Delete training
     await db.training.delete({
       where: { id }
     })
-    
+
     return NextResponse.json({ success: true })
   } catch (error) {
     console.error('Error deleting training:', error)

@@ -30,3 +30,83 @@ model Post {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+model ModelConfig {
+  id                String     @id @default(cuid())
+  name              String
+  vocabSize         Int        @default(32000)
+  hiddenDimension   Int        @default(512)
+  layers            Int        @default(8)
+  attentionHeads    Int        @default(8)
+  intermediateSize  Int        @default(2048)
+  maxPositionEmbeds Int        @default(2048)
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+  trainings         Training[]
+}
+
+model Dataset {
+  id          String     @id @default(cuid())
+  name        String
+  type        String
+  description String?
+  filePath    String?
+  fileSize    Int?
+  numSamples  Int        @default(0)
+  status      String     @default("ready")
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  trainings   Training[]
+}
+
+model Training {
+  id                  String        @id @default(cuid())
+  name                String
+  status              String        @default("pending")
+  modelConfigId       String
+  modelConfig         ModelConfig   @relation(fields: [modelConfigId], references: [id])
+  datasetId           String
+  dataset             Dataset       @relation(fields: [datasetId], references: [id])
+  learningRate         Float         @default(0.0003)
+  batchSize            Int           @default(32)
+  epochs               Int           @default(3)
+  warmupSteps          Int           @default(100)
+  weightDecay          Float         @default(0.01)
+  entropyThresholdLow  Float         @default(1.0)
+  entropyThresholdHigh Float         @default(5.0)
+  useSampleFiltering   Boolean       @default(true)
+  useCurriculum        Boolean       @default(true)
+  fisherOptimization   Boolean       @default(false)
+  gradientAccumSteps   Int           @default(1)
+  currentEpoch         Int           @default(0)
+  currentStep          Int           @default(0)
+  totalSteps           Int           @default(0)
+  currentLoss          Float?
+  bestLoss             Float?
+  tokensPerSec         Float?
+  perplexity           Float?
+  sparsity             Float?
+  memoryUsed           Float?
+  eta                  String?
+  pid                  Int?
+  outputDir            String?
+  lossHistory          String        @default("[]")
+  startTime            DateTime?
+  endTime              DateTime?
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  exports             ModelExport[]
+}
+
+model ModelExport {
+  id         String   @id @default(cuid())
+  trainingId String
+  training   Training @relation(fields: [trainingId], references: [id])
+  name       String
+  format     String
+  filePath   String?
+  fileSize   Int?
+  status     String   @default("pending")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}

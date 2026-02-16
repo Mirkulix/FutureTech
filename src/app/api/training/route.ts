@@ -1,63 +1,61 @@
-import { NextRequest, NextResponse } from 'next/server';
-
-// Training status state (in production, use a proper database)
-let trainingState = {
-  isRunning: false,
-  currentEpoch: 0,
-  currentBatch: 0,
-  totalBatches: 100,
-  loss: 0,
-  perplexity: 0,
-  tokensPerSec: 0,
-  sparsity: 0,
-  eta: '--:--:--',
-  memoryUsed: 0,
-};
+import { NextRequest, NextResponse } from 'next/server'
+import { startTraining, stopTraining, getLatestStatus } from '@/lib/process-manager'
+import { db } from '@/lib/db'
 
 export async function GET() {
+  // Return live status if training is running
+  const liveStatus = getLatestStatus()
+  if (liveStatus) {
+    return NextResponse.json({ status: 'ok', training: liveStatus })
+  }
+
+  // Fall back to latest DB record
+  const latest = await db.training.findFirst({
+    orderBy: { updatedAt: 'desc' },
+    include: { modelConfig: true, dataset: true },
+  })
   return NextResponse.json({
     status: 'ok',
-    training: trainingState,
-  });
+    training: latest ? { isRunning: false, ...latest } : null,
+  })
 }
 
 export async function POST(request: NextRequest) {
-  const body = await request.json();
-  const { action, config } = body;
+  const body = await request.json()
+  const { action } = body
 
   switch (action) {
-    case 'start':
-      trainingState.isRunning = true;
-      // In production, spawn Python training process here
-      return NextResponse.json({ 
-        status: 'started', 
-        message: 'Training started',
-        config 
-      });
+    case 'start': {
+      const { trainingId, config } = body
 
-    case 'stop':
-      trainingState.isRunning = false;
-      return NextResponse.json({ 
-        status: 'stopped', 
-        message: 'Training stopped' 
-      });
+      if (!trainingId || !config) {
+        return NextResponse.json(
+          { error: 'Missing trainingId or config' },
+          { status: 400 }
+        )
+      }
 
-    case 'update':
-      // Update training state (called by Python backend)
-      trainingState = { ...trainingState, ...body.state };
-      return NextResponse.json({ status: 'updated' });
+      // Verify training exists in DB
+      const training = await db.training.findUnique({ where: { id: trainingId } })
+      if (!training) {
+        return NextResponse.json({ error: 'Training not found' }, { status: 404 })
+      }
 
-    case 'export':
-      // Export model
-      return NextResponse.json({ 
-        status: 'exporting',
-        format: body.format 
-      });
+      try {
+        await startTraining(trainingId, config)
+        return NextResponse.json({ status: 'started', trainingId })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error'
+        return NextResponse.json({ error: message }, { status: 500 })
+      }
+    }
+
+    case 'stop': {
+      await stopTraining()
+      return NextResponse.json({ status: 'stopped' })
+    }
 
     default:
-      return NextResponse.json({ 
-        status: 'error', 
-        message: 'Unknown action' 
-      }, { status: 400 });
+      return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
   }
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -13,10 +13,12 @@ import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { Separator } from '@/components/ui/separator';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { 
-  Zap, Settings, Database, Play, Pause, Download, Upload, 
+import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from '@/components/ui/chart';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts';
+import {
+  Zap, Settings, Database, Play, Pause, Download, Upload,
   Activity, Brain, HardDrive, Clock, TrendingUp, AlertCircle,
-  CheckCircle2, Loader2, FileText, Sparkles
+  CheckCircle2, Loader2, FileText, Sparkles, Wifi, RefreshCw
 } from 'lucide-react';
 
 // Types
@@ -46,6 +48,8 @@ interface TrainingStatus {
   currentEpoch: number;
   currentBatch: number;
   totalBatches: number;
+  globalStep: number;
+  totalSteps: number;
   loss: number;
   perplexity: number;
   tokensPerSec: number;
@@ -77,6 +81,19 @@ const DATASETS = [
   { id: 'custom', name: 'Custom Upload', size: 'Variable' },
 ];
 
+// Chart data types
+interface MetricsDataPoint {
+  step: number;
+  loss: number;
+  perplexity: number;
+  tokensPerSec: number;
+}
+
+const chartConfig = {
+  loss: { label: 'Loss', color: '#3b82f6' },
+  tokensPerSec: { label: 'Tokens/s', color: '#22c55e' },
+} satisfies ChartConfig;
+
 export default function TernaryLLMTrainer() {
   // Model configuration
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
@@ -107,6 +124,8 @@ export default function TernaryLLMTrainer() {
     currentEpoch: 0,
     currentBatch: 0,
     totalBatches: 100,
+    globalStep: 0,
+    totalSteps: 1,
     loss: 0,
     perplexity: 0,
     tokensPerSec: 0,
@@ -117,8 +136,12 @@ export default function TernaryLLMTrainer() {
 
   const [selectedDataset, setSelectedDataset] = useState('wikitext-2');
   const [modelStats, setModelStats] = useState<ModelStats | null>(null);
-  const [lossHistory, setLossHistory] = useState<number[]>([]);
+  const [metricsHistory, setMetricsHistory] = useState<MetricsDataPoint[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
+  const [trainingId, setTrainingId] = useState<string | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const [sseStatus, setSseStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // Calculate model stats when config changes
   useEffect(() => {
@@ -164,62 +187,274 @@ export default function TernaryLLMTrainer() {
     }));
   };
 
-  // Start training
+  // Connect SSE stream - called directly from startTraining() BEFORE spawning Python
+  const connectSSE = useCallback(() => {
+    // Close any existing connection
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+
+    const es = new EventSource('/api/training/stream');
+    eventSourceRef.current = es;
+
+    es.onmessage = (event) => {
+      try {
+        // Connection successful - update status
+        if (sseStatus !== 'connected') {
+          setSseStatus('connected');
+          setConnectionError(null);
+        }
+        
+        const msg = JSON.parse(event.data);
+        const { type, data } = msg;
+        if (type === 'metrics') {
+          setStatus(prev => ({
+            ...prev,
+            isRunning: true,
+            currentEpoch: data.epoch ?? prev.currentEpoch,
+            currentBatch: data.batch ?? prev.currentBatch,
+            totalBatches: data.totalBatches ?? prev.totalBatches,
+            globalStep: data.globalStep ?? prev.globalStep,
+            totalSteps: data.totalSteps ?? prev.totalSteps,
+            loss: data.loss ?? prev.loss,
+            perplexity: data.perplexity ?? prev.perplexity,
+            tokensPerSec: data.tokensPerSec ?? prev.tokensPerSec,
+            sparsity: data.sparsity ?? prev.sparsity,
+            eta: data.eta ?? prev.eta,
+          }));
+          if (typeof data.loss === 'number') {
+            setMetricsHistory(prev => [...prev.slice(-99), {
+              step: data.globalStep ?? prev.length,
+              loss: data.loss,
+              perplexity: data.perplexity ?? 0,
+              tokensPerSec: data.tokensPerSec ?? 0,
+            }]);
+          }
+        } else if (type === 'snapshot') {
+          // Initial snapshot from SSE - restore state
+          if (data.metrics) {
+            setStatus(prev => ({
+              ...prev,
+              isRunning: true,
+              currentEpoch: data.metrics.epoch ?? prev.currentEpoch,
+              currentBatch: data.metrics.batch ?? prev.currentBatch,
+              totalBatches: data.metrics.totalBatches ?? prev.totalBatches,
+              globalStep: data.metrics.globalStep ?? prev.globalStep,
+              totalSteps: data.metrics.totalSteps ?? prev.totalSteps,
+              loss: data.metrics.loss ?? prev.loss,
+              perplexity: data.metrics.perplexity ?? prev.perplexity,
+              tokensPerSec: data.metrics.tokensPerSec ?? prev.tokensPerSec,
+              sparsity: data.metrics.sparsity ?? prev.sparsity,
+            }));
+          }
+          if (data.lossHistory && Array.isArray(data.lossHistory)) {
+            setMetricsHistory(data.lossHistory.map((l: number, i: number) => ({
+              step: i, loss: l, perplexity: 0, tokensPerSec: 0,
+            })));
+          }
+        } else if (type === 'log' || type === 'status' || type === 'init' || type === 'data_loaded') {
+          const text = data.text || data.message || JSON.stringify(data);
+          setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${text}`]);
+        } else if (type === 'completed' || type === 'finished') {
+          setStatus(prev => ({ ...prev, isRunning: false }));
+          setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] Training abgeschlossen!`]);
+          es.close();
+          eventSourceRef.current = null;
+        } else if (type === 'error') {
+          setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ERROR: ${data.message}`]);
+        }
+      } catch {
+        // Ignore parse errors (e.g. heartbeat)
+      }
+    };
+
+    es.onopen = () => {
+      setSseStatus('connected');
+      setConnectionError(null);
+      setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ✓ SSE verbunden - warte auf Training...`]);
+    };
+
+    es.onerror = (event) => {
+      setSseStatus('error');
+      const errorMsg = 'SSE Verbindung fehlgeschlagen. Server nicht erreichbar oder Training nicht gestartet.';
+      setConnectionError(errorMsg);
+      setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ✗ ${errorMsg}`]);
+      console.error('[SSE] Connection error:', event);
+    };
+  }, []);
+
+  // Start training - real API calls
   const startTraining = useCallback(async () => {
+    const ts = () => new Date().toLocaleTimeString();
+
+    // Sofort UI-State setzen damit Stop-Button erscheint
     setStatus(prev => ({ ...prev, isRunning: true }));
-    setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] Training gestartet...`]);
-    
-    // Simulate training progress
-    let epoch = 0;
-    let batch = 0;
-    let currentLoss = 8.5;
-    
-    const interval = setInterval(() => {
-      batch++;
-      
-      if (batch >= status.totalBatches) {
-        batch = 0;
-        epoch++;
-        currentLoss *= 0.85; // Decrease loss each epoch
-      }
-      
-      const progress = ((epoch * status.totalBatches + batch) / (trainingConfig.epochs * status.totalBatches)) * 100;
-      
-      setStatus(prev => ({
-        ...prev,
-        currentEpoch: epoch,
-        currentBatch: batch,
-        loss: currentLoss + Math.random() * 0.1,
-        perplexity: Math.exp(currentLoss),
-        tokensPerSec: 5000 + Math.random() * 2000,
-        sparsity: 60 + Math.random() * 10,
-        eta: `${trainingConfig.epochs - epoch}h ${Math.floor((status.totalBatches - batch) * 0.5)}m`,
-        memoryUsed: modelStats?.memoryMB || 0,
-      }));
-      
-      setLossHistory(prev => [...prev.slice(-50), currentLoss]);
-      
-      if (epoch >= trainingConfig.epochs) {
-        clearInterval(interval);
-        setStatus(prev => ({ ...prev, isRunning: false }));
-        setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] Training abgeschlossen!`]);
-      }
-    }, 100);
-    
-    return () => clearInterval(interval);
-  }, [status.totalBatches, trainingConfig.epochs, modelStats?.memoryMB]);
+    setLogs(prev => [...prev, `[${ts()}] Training wird vorbereitet...`]);
+    setMetricsHistory([]);
 
-  // Stop training
-  const stopTraining = () => {
-    setStatus(prev => ({ ...prev, isRunning: false }));
-    setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] Training gestoppt.`]);
-  };
+    try {
+      // 1. Create ModelConfig in DB
+      const cfgRes = await fetch('/api/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: `TernaryLLM-${Date.now()}`,
+          vocabSize: modelConfig.vocabSize,
+          hiddenDimension: modelConfig.hiddenDim,
+          layers: modelConfig.numLayers,
+          attentionHeads: modelConfig.numHeads,
+          intermediateSize: modelConfig.intermediateDim,
+          maxPositionEmbeds: modelConfig.maxSeqLen,
+        }),
+      });
+      const cfgData = await cfgRes.json();
+      if (!cfgRes.ok) throw new Error(cfgData.error || 'Model config creation failed');
+      const { config: dbConfig } = cfgData;
+      setLogs(prev => [...prev, `[${ts()}] Model config created: ${dbConfig.id}`]);
 
-  // Export model
-  const exportModel = (format: string) => {
-    setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] Exportiere als ${format}...`]);
-    // In real implementation, this would call the Python backend
-  };
+      // 2. Create dataset record
+      const dsRes = await fetch('/api/datasets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: selectedDataset,
+          type: selectedDataset,
+        }),
+      });
+      const dsData = await dsRes.json();
+      if (!dsRes.ok) throw new Error(dsData.error || 'Dataset creation failed');
+      const { dataset: dbDataset } = dsData;
+      setLogs(prev => [...prev, `[${ts()}] Dataset record created: ${dbDataset.id}`]);
+
+      // 3. Create Training record
+      const trainRes = await fetch('/api/train', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: `Training-${Date.now()}`,
+          modelConfigId: dbConfig.id,
+          datasetId: dbDataset.id,
+          epochs: trainingConfig.epochs,
+          batchSize: trainingConfig.batchSize,
+          learningRate: trainingConfig.learningRate,
+          warmupSteps: trainingConfig.warmupSteps,
+          fisherOptimization: trainingConfig.useFisher,
+          useSampleFiltering: trainingConfig.useSampleFiltering,
+          useCurriculum: trainingConfig.useCurriculum,
+          entropyThresholdLow: trainingConfig.entropyThresholdLow,
+          entropyThresholdHigh: trainingConfig.entropyThresholdHigh,
+        }),
+      });
+      const trainData = await trainRes.json();
+      if (!trainRes.ok) throw new Error(trainData.error || 'Training record creation failed');
+      const { training } = trainData;
+      setTrainingId(training.id);
+      setLogs(prev => [...prev, `[${ts()}] Training record created: ${training.id}`]);
+
+      // 4. Connect SSE BEFORE starting training to catch all events
+      connectSSE();
+
+      // 5. Start actual training via process manager
+      const startRes = await fetch('/api/training', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'start',
+          trainingId: training.id,
+          config: {
+            vocabSize: modelConfig.vocabSize,
+            hiddenDim: modelConfig.hiddenDim,
+            numLayers: modelConfig.numLayers,
+            numHeads: modelConfig.numHeads,
+            maxSeqLen: modelConfig.maxSeqLen,
+            intermediateDim: modelConfig.intermediateDim,
+            epochs: trainingConfig.epochs,
+            batchSize: trainingConfig.batchSize,
+            learningRate: trainingConfig.learningRate,
+            warmupSteps: trainingConfig.warmupSteps,
+            useFisher: trainingConfig.useFisher,
+            useSampleFiltering: trainingConfig.useSampleFiltering,
+            useCurriculum: trainingConfig.useCurriculum,
+            entropyThresholdLow: trainingConfig.entropyThresholdLow,
+            entropyThresholdHigh: trainingConfig.entropyThresholdHigh,
+            dataPath: selectedDataset === 'custom' ? 'sample' : selectedDataset,
+          },
+        }),
+      });
+
+      if (!startRes.ok) {
+        const err = await startRes.json();
+        throw new Error(err.error || 'Failed to start training');
+      }
+
+      setLogs(prev => [...prev, `[${ts()}] Training gestartet!`]);
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setLogs(prev => [...prev, `[${ts()}] ERROR: ${msg}`]);
+      setStatus(prev => ({ ...prev, isRunning: false }));
+    }
+  }, [modelConfig, trainingConfig, selectedDataset, connectSSE]);
+
+  // Stop training - real API call
+  const stopTraining = useCallback(async () => {
+    try {
+      await fetch('/api/training', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'stop' }),
+      });
+      setStatus(prev => ({ ...prev, isRunning: false }));
+      setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] Training gestoppt.`]);
+      // Close SSE connection
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    } catch {
+      setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] Fehler beim Stoppen.`]);
+    }
+  }, []);
+
+  // Export model - real API call
+  const exportModel = useCallback(async (format: string) => {
+    const ts = () => new Date().toLocaleTimeString();
+    if (!trainingId) {
+      setLogs(prev => [...prev, `[${ts()}] Kein Training vorhanden zum Exportieren.`]);
+      return;
+    }
+    setLogs(prev => [...prev, `[${ts()}] Exportiere als ${format}...`]);
+    try {
+      const res = await fetch('/api/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'export',
+          trainingId,
+          name: `ternary-llm-${Date.now()}`,
+          format: format.toLowerCase(),
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Export failed');
+      }
+      setLogs(prev => [...prev, `[${ts()}] Export gestartet (${format}). Wird im Hintergrund verarbeitet.`]);
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setLogs(prev => [...prev, `[${ts()}] Export-Fehler: ${msg}`]);
+    }
+  }, [trainingId]);
+
+  // Cleanup SSE on unmount
+  useEffect(() => {
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, []);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white">
@@ -245,6 +480,16 @@ export default function TernaryLLMTrainer() {
                 <HardDrive className="w-3 h-3 mr-1 text-blue-400" />
                 16x Compression
               </Badge>
+              {status.isRunning && (
+                <Badge
+                  variant="destructive"
+                  className="cursor-pointer hover:bg-red-700 transition-colors"
+                  onClick={stopTraining}
+                >
+                  <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                  Training läuft... (Stop)
+                </Badge>
+              )}
             </div>
           </div>
         </div>
@@ -312,8 +557,8 @@ export default function TernaryLLMTrainer() {
                         <span>Epoch {status.currentEpoch + 1}/{trainingConfig.epochs}</span>
                         <span>Batch {status.currentBatch}/{status.totalBatches}</span>
                       </div>
-                      <Progress 
-                        value={(status.currentEpoch / trainingConfig.epochs) * 100} 
+                      <Progress
+                        value={status.totalSteps > 0 ? (status.globalStep / status.totalSteps) * 100 : 0}
                         className="h-2"
                       />
                     </div>
@@ -348,47 +593,187 @@ export default function TernaryLLMTrainer() {
                   </CardContent>
                 </Card>
 
-                {/* Loss Chart */}
+                {/* Loss Chart - Live recharts LineChart */}
                 <Card className="bg-slate-800/50 border-slate-700">
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                       <TrendingUp className="w-5 h-5 text-blue-400" />
-                      Training Progress
+                      Loss
+                      {metricsHistory.length > 0 && (
+                        <Badge variant="outline" className="ml-2 bg-blue-900/30">
+                          {metricsHistory.length} Punkte
+                        </Badge>
+                      )}
                     </CardTitle>
                   </CardHeader>
                   <CardContent>
-                    <div className="h-48 flex items-end gap-1">
-                      {lossHistory.map((loss, i) => (
-                        <div 
-                          key={i}
-                          className="flex-1 bg-gradient-to-t from-blue-500 to-blue-300 rounded-t"
-                          style={{ height: `${Math.min(100, (10 - loss) * 10)}%` }}
-                        />
-                      ))}
-                      {lossHistory.length === 0 && (
-                        <div className="flex-1 flex items-center justify-center text-slate-500">
-                          Start training to see loss history
-                        </div>
+                    {metricsHistory.length > 0 ? (
+                      <ChartContainer config={chartConfig} className="h-48 w-full">
+                        <LineChart data={metricsHistory}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                          <XAxis
+                            dataKey="step"
+                            stroke="#94a3b8"
+                            fontSize={12}
+                            tickFormatter={(v) => `${v}`}
+                          />
+                          <YAxis
+                            stroke="#94a3b8"
+                            fontSize={12}
+                            tickFormatter={(v) => v.toFixed(2)}
+                          />
+                          <ChartTooltip content={<ChartTooltipContent />} />
+                          <Line
+                            type="monotone"
+                            dataKey="loss"
+                            stroke="var(--color-loss)"
+                            strokeWidth={2}
+                            dot={false}
+                            isAnimationActive={false}
+                          />
+                        </LineChart>
+                      </ChartContainer>
+                    ) : (
+                      <div className="h-48 flex flex-col items-center justify-center text-slate-500">
+                        <Activity className="w-12 h-12 mb-2 opacity-50" />
+                        <p>Noch kein Training gestartet</p>
+                        <p className="text-xs text-slate-600">Klicke auf "Start Training" um zu beginnen</p>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+
+                {/* Throughput Chart - Tokens/sec */}
+                <Card className="bg-slate-800/50 border-slate-700">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Activity className="w-5 h-5 text-green-400" />
+                      Throughput (Tokens/sec)
+                      {metricsHistory.length > 0 && (
+                        <Badge variant="outline" className="ml-2 bg-green-900/30">
+                          Avg: {Math.round(metricsHistory.reduce((a, b) => a + b.tokensPerSec, 0) / metricsHistory.length)}
+                        </Badge>
                       )}
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    {metricsHistory.length > 0 ? (
+                      <ChartContainer config={chartConfig} className="h-32 w-full">
+                        <LineChart data={metricsHistory}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                          <XAxis
+                            dataKey="step"
+                            stroke="#94a3b8"
+                            fontSize={12}
+                            tickFormatter={(v) => `${v}`}
+                          />
+                          <YAxis
+                            stroke="#94a3b8"
+                            fontSize={12}
+                            tickFormatter={(v) => `${Math.round(v)}`}
+                          />
+                          <ChartTooltip content={<ChartTooltipContent />} />
+                          <Line
+                            type="monotone"
+                            dataKey="tokensPerSec"
+                            stroke="var(--color-tokensPerSec)"
+                            strokeWidth={2}
+                            dot={false}
+                            isAnimationActive={false}
+                          />
+                        </LineChart>
+                      </ChartContainer>
+                    ) : (
+                      <div className="h-32 flex flex-col items-center justify-center text-slate-500">
+                        <Activity className="w-8 h-8 mb-2 opacity-50" />
+                        <p className="text-xs">Warte auf Trainingsdaten...</p>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+
+                {/* Debug Panel - Connection Status */}
+                <Card className={`border-2 ${sseStatus === 'connected' ? 'bg-green-900/30 border-green-500' : sseStatus === 'error' ? 'bg-red-900/30 border-red-500' : 'bg-slate-800/50 border-slate-700'}`}>
+                  <CardHeader>
+                    <CardTitle className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Wifi className="w-5 h-5" />
+                        Debug: SSE Connection
+                      </div>
+                      <Badge variant={sseStatus === 'connected' ? 'default' : sseStatus === 'error' ? 'destructive' : 'outline'} className={sseStatus === 'connected' ? 'bg-green-600' : ''}>
+                        {sseStatus === 'connected' ? '🟢 Verbunden' : sseStatus === 'connecting' ? '🟡 Verbinde...' : sseStatus === 'error' ? '🔴 Fehler' : '⚪ Getrennt'}
+                      </Badge>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="grid grid-cols-2 gap-2 text-sm">
+                      <div className="text-slate-400">Status:</div>
+                      <div className="font-mono">{sseStatus}</div>
+                      <div className="text-slate-400">Letzte Nachricht:</div>
+                      <div className="font-mono">{metricsHistory.length > 0 ? `Step ${metricsHistory[metricsHistory.length-1].step}` : 'Keine'}</div>
+                      <div className="text-slate-400">Datenpunkte:</div>
+                      <div className="font-mono">{metricsHistory.length}</div>
+                      <div className="text-slate-400">Letzter Loss:</div>
+                      <div className="font-mono text-red-400">{metricsHistory.length > 0 ? metricsHistory[metricsHistory.length-1].loss.toFixed(4) : '--'}</div>
                     </div>
+                    {connectionError && (
+                      <Alert variant="destructive" className="mt-2">
+                        <AlertCircle className="h-4 w-4" />
+                        <AlertTitle>Verbindungsfehler</AlertTitle>
+                        <AlertDescription>{connectionError}</AlertDescription>
+                      </Alert>
+                    )}
+                    <Button 
+                      variant="outline" 
+                      size="sm" 
+                      className="w-full mt-2"
+                      onClick={() => {
+                        setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] 🔄 Manuelle SSE-Verbindung...`]);
+                        connectSSE();
+                      }}
+                    >
+                      <RefreshCw className="w-4 h-4 mr-2" />
+                      Verbindung neu herstellen
+                    </Button>
                   </CardContent>
                 </Card>
 
                 {/* Logs */}
                 <Card className="bg-slate-800/50 border-slate-700">
                   <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <FileText className="w-5 h-5 text-slate-400" />
-                      Training Logs
+                    <CardTitle className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <FileText className="w-5 h-5 text-slate-400" />
+                        Training Logs
+                        <Badge variant="outline" className="ml-2 bg-slate-700">
+                          {logs.length} Einträge
+                        </Badge>
+                      </div>
+                      <Button 
+                        variant="ghost" 
+                        size="sm" 
+                        onClick={() => setLogs([])}
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                      </Button>
                     </CardTitle>
                   </CardHeader>
                   <CardContent>
-                    <div className="bg-slate-900 rounded-lg p-4 h-40 overflow-y-auto font-mono text-sm">
+                    <div className="bg-slate-900 rounded-lg p-4 h-64 overflow-y-auto font-mono text-sm">
                       {logs.map((log, i) => (
-                        <div key={i} className="text-slate-300">{log}</div>
+                        <div 
+                          key={i} 
+                          className={`${log.includes('ERROR') ? 'text-red-400' : log.includes('✓') ? 'text-green-400' : log.includes('✗') ? 'text-red-400' : log.includes('🔄') ? 'text-yellow-400' : 'text-slate-300'}`}
+                        >
+                          {log}
+                        </div>
                       ))}
                       {logs.length === 0 && (
-                        <div className="text-slate-500">No logs yet...</div>
+                        <div className="text-slate-500 flex flex-col items-center justify-center h-full">
+                          <FileText className="w-8 h-8 mb-2 opacity-50" />
+                          <p>Keine Logs vorhanden</p>
+                          <p className="text-xs">Starte ein Training um Logs zu sehen</p>
+                        </div>
                       )}
                     </div>
                   </CardContent>

@@ -117,21 +117,34 @@ class TrainingMonitor:
     
     def get_stats(self) -> Dict[str, Any]:
         stats = {
-            "total_time": time.time() - self.start_time if self.start_time else 0,
-            "avg_loss": np.mean(self.metrics["loss"][-100:]) if self.metrics["loss"] else 0,
-            "perplexity": self.get_perplexity(),
-            "avg_tokens_per_sec": np.mean(self.metrics["tokens_per_sec"][-100:]) if self.metrics["tokens_per_sec"] else 0,
-            "avg_sparsity": np.mean(self.metrics["sparsity"][-100:]) if self.metrics["sparsity"] else 0,
-            "samples_filtered": self.metrics["samples_filtered"],
-            "samples_total": self.metrics["samples_total"],
-            "filter_ratio": self.metrics["samples_filtered"] / max(self.metrics["samples_total"], 1),
+            "total_time": time.time() - self.start_time if self.start_time else 0.0,
+            "avg_loss": float(np.mean(self.metrics["loss"][-100:])) if self.metrics["loss"] else 0.0,
+            "perplexity": float(self.get_perplexity()),
+            "avg_tokens_per_sec": float(np.mean(self.metrics["tokens_per_sec"][-100:])) if self.metrics["tokens_per_sec"] else 0.0,
+            "avg_sparsity": float(np.mean(self.metrics["sparsity"][-100:])) if self.metrics["sparsity"] else 0.0,
+            "samples_filtered": int(self.metrics["samples_filtered"]),
+            "samples_total": int(self.metrics["samples_total"]),
+            "filter_ratio": float(self.metrics["samples_filtered"] / max(self.metrics["samples_total"], 1)),
         }
         return stats
     
     def save(self, path: str):
+        class _NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                if isinstance(obj, (np.integer,)):
+                    return int(obj)
+                if isinstance(obj, (np.floating,)):
+                    return float(obj)
+                if isinstance(obj, np.bool_):
+                    return bool(obj)
+                if hasattr(obj, 'item'):
+                    return obj.item()
+                return super().default(obj)
+
         with open(path, "w") as f:
-            json.dump({k: v if not isinstance(v, np.ndarray) else v.tolist() 
-                      for k, v in self.metrics.items()}, f, indent=2)
+            json.dump(self.metrics, f, indent=2, cls=_NumpyEncoder)
 
 
 class TernaryTrainer:
@@ -362,15 +375,15 @@ class TernaryTrainer:
             checkpoint_path = Path(checkpoint_dir)
             checkpoint_path.mkdir(parents=True, exist_ok=True)
         
-        print(f"\n{'='*60}")
-        print(f"  TernaryLLM Training")
-        print(f"{'='*60}")
-        print(f"  Epochs: {self.config.epochs}")
-        print(f"  Batch Size: {self.config.batch_size}")
-        print(f"  Learning Rate: {self.config.learning_rate}")
-        print(f"  Samples: {len(data)}")
-        print(f"  Model Params: {self.model.count_parameters()['total']:,}")
-        print(f"{'='*60}\n")
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"  TernaryLLM Training", file=sys.stderr)
+        print(f"{'='*60}", file=sys.stderr)
+        print(f"  Epochs: {self.config.epochs}", file=sys.stderr)
+        print(f"  Batch Size: {self.config.batch_size}", file=sys.stderr)
+        print(f"  Learning Rate: {self.config.learning_rate}", file=sys.stderr)
+        print(f"  Samples: {len(data)}", file=sys.stderr)
+        print(f"  Model Params: {self.model.count_parameters()['total']:,}", file=sys.stderr)
+        print(f"{'='*60}\n", file=sys.stderr)
         
         for epoch in range(self.config.epochs):
             self.current_epoch = epoch
@@ -389,13 +402,17 @@ class TernaryTrainer:
                   f"Loss={epoch_stats['epoch_loss']:.4f}, "
                   f"PPL={stats['perplexity']:.2f}, "
                   f"LR={stats['avg_loss']:.6f}, "
-                  f"Toks/sec={stats['avg_tokens_per_sec']:.0f}")
+                  f"Toks/sec={stats['avg_tokens_per_sec']:.0f}",
+                  file=sys.stderr)
             
             # Save Checkpoint
             if checkpoint_dir and (epoch + 1) % self.config.save_every == 0:
-                ckpt_path = checkpoint_path / f"checkpoint_epoch_{epoch+1}"
-                self.model.save(str(ckpt_path))
-                self.monitor.save(str(ckpt_path / "training_log.json"))
+                try:
+                    ckpt_path = checkpoint_path / f"checkpoint_epoch_{epoch+1}"
+                    self.model.save(str(ckpt_path))
+                    self.monitor.save(str(ckpt_path / "training_log.json"))
+                except Exception as e:
+                    print(f"Warning: checkpoint save failed: {e}", file=sys.stderr)
         
         return self.monitor.get_stats()
     

@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { spawn } from 'child_process'
 import { db } from '@/lib/db'
+import { findPython } from '@/lib/process-manager'
+import { statSync } from 'fs'
+import path from 'path'
 
 // GET - List all model configs or exports
 export async function GET(request: NextRequest) {
@@ -86,26 +90,94 @@ export async function POST(request: NextRequest) {
         )
       }
       
-      // Simulate export creation
+      // Determine model path from training output
+      const modelDir = training.outputDir
+        ? path.join(training.outputDir, 'final')
+        : `./training_output/${trainingId}/final`
+      const exportDir = `./exports/${trainingId}`
+
+      // Create export record
       const modelExport = await db.modelExport.create({
         data: {
           trainingId,
           name,
           format,
-          filePath: `/exports/${name}.${format === 'gguf' ? 'gguf' : format === 'huggingface' ? 'bin' : 'pt'}`,
-          fileSize: Math.floor(Math.random() * 1000000000) + 100000000, // Simulated size
+          filePath: exportDir,
+          fileSize: 0,
           status: 'processing'
         }
       })
-      
-      // Simulate processing delay
-      setTimeout(async () => {
-        await db.modelExport.update({
-          where: { id: modelExport.id },
-          data: { status: 'completed' }
-        })
-      }, 2000)
-      
+
+      // Spawn Python bridge export in the background
+      const pythonCmd = findPython()
+      const args: string[] = []
+      if (pythonCmd === 'py') args.push('-3')
+      args.push(
+        '-u', '-m', 'ternary_llm.bridge', 'export',
+        '--model', modelDir,
+        '--output', exportDir,
+        '--format', format,
+        '--name', name,
+      )
+
+      const child = spawn(pythonCmd, args, {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+
+      // Handle completion asynchronously
+      let stdout = ''
+      child.stdout!.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
+
+      child.on('close', async (code) => {
+        try {
+          if (code === 0) {
+            // Try to determine real file size
+            const ext = format === 'gguf' ? 'gguf' : format === 'huggingface' ? 'bin' : 'pt'
+            const exportedFile = path.join(exportDir, `${name}.${ext}`)
+            let fileSize = 0
+            try {
+              fileSize = statSync(exportedFile).size
+            } catch {
+              // File might have a different name; check stdout for path
+              const lines = stdout.split('\n').filter(l => l.trim())
+              for (const line of lines) {
+                try {
+                  const msg = JSON.parse(line)
+                  if (msg.type === 'export_completed' && msg.data?.output) {
+                    // Best effort size calculation from directory
+                    break
+                  }
+                } catch { /* non-JSON */ }
+              }
+            }
+
+            await db.modelExport.update({
+              where: { id: modelExport.id },
+              data: {
+                status: 'completed',
+                filePath: exportDir,
+                fileSize,
+              }
+            })
+          } else {
+            await db.modelExport.update({
+              where: { id: modelExport.id },
+              data: { status: 'failed' }
+            })
+          }
+        } catch { /* DB might be closed */ }
+      })
+
+      child.on('error', async () => {
+        try {
+          await db.modelExport.update({
+            where: { id: modelExport.id },
+            data: { status: 'failed' }
+          })
+        } catch { /* best effort */ }
+      })
+
       return NextResponse.json({ export: modelExport }, { status: 201 })
     } else {
       // Create model config

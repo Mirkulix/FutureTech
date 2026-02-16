@@ -49,3 +49,19 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# Python
+__pycache__/
+*.pyc
+
+# Training artifacts
+training_output/
+datasets/
+output/
+logs/
+
+# Database
+*.db
+
+# Windows artifacts
+nul
