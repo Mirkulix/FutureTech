@@ -1,17 +1,8 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
-
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
+import Link from "next/link";
+import { Button } from "@/components/ui/button";
 
 export const metadata: Metadata = {
   title: "Z.ai Code Scaffold - AI-Powered Development",
@@ -43,10 +34,47 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
+        className="antialiased bg-background text-foreground"
       >
-        {children}
-        <Toaster />
+        <div className="min-h-screen flex flex-col">
+          <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur">
+            <div className="container mx-auto px-4 py-3 flex items-center justify-between gap-4">
+              <Link href="/landing" className="flex items-center gap-2">
+                <span className="h-7 w-7 rounded-lg bg-gradient-to-tr from-cyan-500 to-violet-500" />
+                <div className="flex flex-col leading-tight">
+                  <span className="text-sm font-semibold">FutureTech</span>
+                  <span className="text-[11px] text-slate-400">AI Creation Platform</span>
+                </div>
+              </Link>
+              <nav className="flex items-center gap-2 text-xs sm:text-sm">
+                <Link href="/landing">
+                  <Button variant="ghost" size="sm" className="text-slate-300">
+                    Landing
+                  </Button>
+                </Link>
+                <Link href="/">
+                  <Button variant="ghost" size="sm" className="text-slate-300">
+                    Training
+                  </Button>
+                </Link>
+                <Link href="/live">
+                  <Button variant="ghost" size="sm" className="text-slate-300">
+                    Live
+                  </Button>
+                </Link>
+                <Link href="/dashboard">
+                  <Button variant="ghost" size="sm" className="text-slate-300">
+                    Dashboard
+                  </Button>
+                </Link>
+              </nav>
+            </div>
+          </header>
+          <main className="flex-1">
+            {children}
+          </main>
+          <Toaster />
+        </div>
       </body>
     </html>
   );

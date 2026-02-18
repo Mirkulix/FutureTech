@@ -28,14 +28,65 @@ export async function GET() {
 // POST - Create a new training
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json();
-    // Destructure expected fields; add defaults or validation as needed
-    const { name, model, dataset, epochs, batchSize, learningRate, useFisher } = body;
+    const body = await request.json()
 
-    // Generate a simple ID (in real app, DB would generate this)
-    const id = Date.now().toString();
-    const outputDir = path.join(process.cwd(), 'output', id);
-    const dataPath = path.join(process.cwd(), 'data');
+    // Branch 1: Full DB-backed training (used by Haupt-Dashboard)
+    if (body.modelConfigId && body.datasetId) {
+      const {
+        name,
+        modelConfigId,
+        datasetId,
+        epochs,
+        batchSize,
+        learningRate,
+        warmupSteps,
+        fisherOptimization,
+        useSampleFiltering,
+        useCurriculum,
+        entropyThresholdLow,
+        entropyThresholdHigh,
+      } = body
+
+      if (!name || !modelConfigId || !datasetId) {
+        return NextResponse.json(
+          { error: 'Missing required fields: name, modelConfigId, datasetId' },
+          { status: 400 },
+        )
+      }
+
+      const training = await db.training.create({
+        data: {
+          name,
+          modelConfigId,
+          datasetId,
+          epochs,
+          batchSize,
+          learningRate,
+          warmupSteps,
+          fisherOptimization,
+          useSampleFiltering,
+          useCurriculum,
+          entropyThresholdLow,
+          entropyThresholdHigh,
+        },
+      })
+
+      return NextResponse.json({ training }, { status: 201 })
+    }
+
+    // Branch 2: Lightweight Python-Bridge-Training (used von /training/new)
+    const { name, model, dataset, epochs, batchSize, learningRate, useFisher } = body
+
+    if (!name || !model || !dataset) {
+      return NextResponse.json(
+        { error: 'Missing required fields: name, model, dataset' },
+        { status: 400 },
+      )
+    }
+
+    const id = Date.now().toString()
+    const outputDir = path.join(process.cwd(), 'output', id)
+    const dataPath = path.join(process.cwd(), 'data', String(dataset))
 
     const pid = PythonBridge.startTraining({
       id,
@@ -45,21 +96,27 @@ export async function POST(request: NextRequest) {
       batchSize: Number(batchSize),
       learningRate: Number(learningRate),
       useFisher: Boolean(useFisher),
-      baseModel: model || 'base'
-    });
+      baseModel: model || 'base',
+    })
 
-    return NextResponse.json({
-      status: 'started',
-      message: 'Training started successfully',
-      trainingId: id,
-      pid
-    });
+    return NextResponse.json(
+      {
+        status: 'started',
+        message: 'Training started successfully',
+        trainingId: id,
+        pid,
+      },
+      { status: 201 },
+    )
   } catch (error) {
-    console.error('Failed to start training:', error);
-    return NextResponse.json({
-      status: 'error',
-      message: 'Failed to start training process'
-    }, { status: 500 });
+    console.error('Failed to start training:', error)
+    return NextResponse.json(
+      {
+        status: 'error',
+        message: 'Failed to start training process',
+      },
+      { status: 500 },
+    )
   }
 }
 

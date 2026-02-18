@@ -58,6 +58,12 @@ interface TrainingStatus {
   memoryUsed: number;
 }
 
+interface TrainingSnapshot {
+  id: string;
+  name: string;
+  lossHistory: number[];
+}
+
 interface ModelStats {
   totalParams: number;
   ternaryParams: number;
@@ -139,11 +145,66 @@ export default function TernaryLLMTrainer() {
   const [metricsHistory, setMetricsHistory] = useState<MetricsDataPoint[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [trainingId, setTrainingId] = useState<string | null>(null);
+  const [snapshotTraining, setSnapshotTraining] = useState<TrainingSnapshot | null>(null);
+  const [isReplaying, setIsReplaying] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const replayIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [sseStatus, setSseStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // Calculate model stats when config changes
+  useEffect(() => {
+    if (statusPollRef.current) {
+      clearInterval(statusPollRef.current);
+      statusPollRef.current = null;
+    }
+    if (status.isRunning && trainingId) {
+      statusPollRef.current = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/status?id=${trainingId}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          const training = data.training;
+          if (!training) return;
+          setStatus(prev => ({
+            ...prev,
+            currentEpoch: training.currentEpoch ?? prev.currentEpoch,
+            currentBatch: training.currentStep ?? prev.currentBatch,
+            totalBatches: prev.totalBatches,
+            globalStep: training.currentStep ?? prev.globalStep,
+            totalSteps: training.totalSteps ?? prev.totalSteps,
+            loss: training.currentLoss ?? prev.loss,
+            perplexity: training.perplexity ?? prev.perplexity,
+            tokensPerSec: training.tokensPerSec ?? prev.tokensPerSec,
+            sparsity: training.sparsity ?? prev.sparsity,
+            eta: training.eta ?? prev.eta,
+          }));
+          if (Array.isArray(training.lossHistory) && training.lossHistory.length > 0) {
+            const losses = training.lossHistory as number[];
+            setMetricsHistory(
+              losses.map((loss: number, i: number) => ({
+                step: i + 1,
+                loss,
+                perplexity: 0,
+                tokensPerSec: 0,
+              })),
+            );
+          }
+          const tsStatus = typeof training.status === 'string' ? training.status : '';
+          if (tsStatus && tsStatus !== 'running' && tsStatus !== 'paused') {
+            setStatus(prev => ({ ...prev, isRunning: false }));
+            if (statusPollRef.current) {
+              clearInterval(statusPollRef.current);
+              statusPollRef.current = null;
+            }
+          }
+        } catch {
+        }
+      }, 2000);
+    }
+  }, [status.isRunning, trainingId]);
+
   useEffect(() => {
     const calculateStats = () => {
       // Estimate parameters
@@ -284,6 +345,44 @@ export default function TernaryLLMTrainer() {
     };
   }, []);
 
+  const replayLastTraining = useCallback(() => {
+    if (!snapshotTraining || !snapshotTraining.lossHistory.length) {
+      const ts = () => new Date().toLocaleTimeString();
+      setLogs(prev => [...prev, `[${ts()}] Kein gespeichertes Training zum Replay gefunden.`]);
+      return;
+    }
+    if (replayIntervalRef.current) {
+      clearInterval(replayIntervalRef.current);
+      replayIntervalRef.current = null;
+    }
+    const ts = () => new Date().toLocaleTimeString();
+    setLogs(prev => [...prev, `[${ts()}] Replay des letzten Trainings gestartet (${snapshotTraining.name}).`]);
+    setMetricsHistory([]);
+    setIsReplaying(true);
+    const losses = [...snapshotTraining.lossHistory];
+    let index = 0;
+    replayIntervalRef.current = setInterval(() => {
+      index += 1;
+      const loss = losses[index - 1];
+      setMetricsHistory(prev => [
+        ...prev,
+        {
+          step: index,
+          loss,
+          perplexity: 0,
+          tokensPerSec: 0,
+        },
+      ]);
+      if (index >= losses.length) {
+        if (replayIntervalRef.current) {
+          clearInterval(replayIntervalRef.current);
+          replayIntervalRef.current = null;
+        }
+        setIsReplaying(false);
+      }
+    }, 300);
+  }, [snapshotTraining]);
+
   // Start training - real API calls
   const startTraining = useCallback(async () => {
     const ts = () => new Date().toLocaleTimeString();
@@ -349,6 +448,9 @@ export default function TernaryLLMTrainer() {
       const trainData = await trainRes.json();
       if (!trainRes.ok) throw new Error(trainData.error || 'Training record creation failed');
       const { training } = trainData;
+      if (!training || !training.id) {
+        throw new Error('Training API did not return a valid training.id');
+      }
       setTrainingId(training.id);
       setLogs(prev => [...prev, `[${ts()}] Training record created: ${training.id}`]);
 
@@ -448,7 +550,57 @@ export default function TernaryLLMTrainer() {
 
   // Cleanup SSE on unmount
   useEffect(() => {
+    let cancelled = false;
+    const loadSnapshot = async () => {
+      try {
+        const res = await fetch('/api/train');
+        if (!res.ok) return;
+        const data = await res.json();
+        const trainings = data.trainings as Array<{
+          id: string;
+          name: string;
+          lossHistory?: string | null;
+        }>;
+        if (!Array.isArray(trainings) || trainings.length === 0) return;
+        const latest = trainings[0];
+        if (!latest.lossHistory) return;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(latest.lossHistory);
+        } catch {
+          return;
+        }
+        if (!Array.isArray(parsed) || parsed.length === 0) return;
+        if (cancelled) return;
+        const losses = parsed.filter((v) => typeof v === 'number') as number[];
+        if (!losses.length) return;
+        setSnapshotTraining({
+          id: latest.id,
+          name: latest.name,
+          lossHistory: losses,
+        });
+        setMetricsHistory(
+          losses.map((loss, i) => ({
+            step: i + 1,
+            loss,
+            perplexity: 0,
+            tokensPerSec: 0,
+          })),
+        );
+      } catch {
+      }
+    };
+    loadSnapshot();
     return () => {
+      cancelled = true;
+      if (replayIntervalRef.current) {
+        clearInterval(replayIntervalRef.current);
+        replayIntervalRef.current = null;
+      }
+      if (statusPollRef.current) {
+        clearInterval(statusPollRef.current);
+        statusPollRef.current = null;
+      }
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
         eventSourceRef.current = null;
@@ -596,13 +748,26 @@ export default function TernaryLLMTrainer() {
                 {/* Loss Chart - Live recharts LineChart */}
                 <Card className="bg-slate-800/50 border-slate-700">
                   <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <TrendingUp className="w-5 h-5 text-blue-400" />
-                      Loss
-                      {metricsHistory.length > 0 && (
-                        <Badge variant="outline" className="ml-2 bg-blue-900/30">
-                          {metricsHistory.length} Punkte
-                        </Badge>
+                    <CardTitle className="flex items-center gap-2 justify-between">
+                      <div className="flex items-center gap-2">
+                        <TrendingUp className="w-5 h-5 text-blue-400" />
+                        Loss
+                        {metricsHistory.length > 0 && (
+                          <Badge variant="outline" className="ml-2 bg-blue-900/30">
+                            {metricsHistory.length} Punkte
+                          </Badge>
+                        )}
+                      </div>
+                      {snapshotTraining && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={isReplaying}
+                          onClick={replayLastTraining}
+                        >
+                          <RefreshCw className="w-4 h-4 mr-1" />
+                          Replay
+                        </Button>
                       )}
                     </CardTitle>
                   </CardHeader>

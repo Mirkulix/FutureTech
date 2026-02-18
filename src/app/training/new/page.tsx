@@ -3,6 +3,7 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useForm } from "react-hook-form"
 import { z } from "zod"
+import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import {
     Form,
@@ -49,6 +50,8 @@ const formSchema = z.object({
 type FormValues = z.infer<typeof formSchema>
 
 export default function NewTrainingPage() {
+    const router = useRouter()
+
     const form = useForm<FormValues>({
         resolver: zodResolver(formSchema),
         defaultValues: {
@@ -75,7 +78,7 @@ export default function NewTrainingPage() {
             console.log('Training started:', data)
             // Redirect to monitoring page: /monitoring/[id]
             if (data.trainingId) {
-                window.location.href = `/monitoring/${data.trainingId}`
+                router.push(`/monitoring/${data.trainingId}`)
             }
         } catch (error) {
             console.error('Failed to start training:', error)
@@ -305,3 +308,5 @@ export default function NewTrainingPage() {
         </div>
     )
 }
+
+
